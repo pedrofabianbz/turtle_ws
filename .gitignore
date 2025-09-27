@@ -1,0 +1,20 @@
+# Colcon build artifacts
+build/
+install/
+log/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# VSCode / IDE
+.vscode/
+.idea/
+
+# Maps, bag files, temporary data
+*.pgm
+*.yaml
+*.db3
+*.bag
+*.mp4
+*.avi
