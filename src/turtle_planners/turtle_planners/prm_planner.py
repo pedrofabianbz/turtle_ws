@@ -29,7 +29,7 @@ class PRMPlanner(Node):
         # Suscripciones
         self.create_subscription(OccupancyGrid, '/map', self.map_callback, 10)
         self.create_subscription(Odometry, '/odometry/filtered', self.odom_callback, 10)
-        self.create_subscription(PoseStamped, '/goal_pose', self.goal_callback, 10)
+        self.create_subscription(PoseStamped, '/subgoal', self.goal_callback, 10)
 
         # Publicador del plan
         self.plan_pub = self.create_publisher(Path, '/plan', 10)

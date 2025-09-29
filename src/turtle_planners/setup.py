@@ -22,6 +22,7 @@ setup(
         'console_scripts': [
         'prm_planner = turtle_planners.prm_planner:main',
         'rrt_planner = turtle_planners.rrt_planner:main',
+        'frontier_explorer = turtle_planners.frontier_explorer:main',
         ],
     },
 )
