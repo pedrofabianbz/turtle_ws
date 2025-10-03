@@ -26,7 +26,7 @@ class RRTPlanner(Node):
         # Subscriptions
         self.create_subscription(OccupancyGrid, '/map', self.map_callback, 10)
         self.create_subscription(Odometry, '/odometry/filtered', self.odom_callback, 10)
-        self.create_subscription(PoseStamped, '/subgoal', self.goal_callback, 10)
+        self.create_subscription(PoseStamped, '/prm_goal', self.goal_callback, 10)
 
         # Publishers
         self.plan_pub = self.create_publisher(Path, '/plan_rrt', 10)

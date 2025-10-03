@@ -12,7 +12,6 @@ from threading import Lock
 from visualization_msgs.msg import Marker, MarkerArray
 from geometry_msgs.msg import Point
 
-
 class PRMPlanner(Node):
     def __init__(self):
         super().__init__('prm_planner')
@@ -29,12 +28,14 @@ class PRMPlanner(Node):
         # Suscripciones
         self.create_subscription(OccupancyGrid, '/map', self.map_callback, 10)
         self.create_subscription(Odometry, '/odometry/filtered', self.odom_callback, 10)
-        self.create_subscription(PoseStamped, '/subgoal', self.goal_callback, 10)
+        # ahora escuchamos /prm_goal: petición desde Decision Manager
+        self.create_subscription(PoseStamped, '/prm_goal', self.goal_callback, 10)
 
-        # Publicador del plan
+        # Publicadores
         self.plan_pub = self.create_publisher(Path, '/plan', 10)
-        # Publicador de markers para RViz
         self.marker_pub = self.create_publisher(MarkerArray, '/prm_markers', 10)
+        # cuando no haya ruta, publicaremos candidato alcanzable
+        self.candidate_pub = self.create_publisher(PoseStamped, '/prm_candidate', 10)
 
         # Variables internas
         self.map_msg = None
@@ -62,7 +63,8 @@ class PRMPlanner(Node):
             if self.odom is None:
                 self.get_logger().warn("No hay odometría aún, ignorando goal")
                 return
-        self.compute_plan()  # fuera del lock
+        # fuera del lock llamamos compute_plan
+        self.compute_plan()
 
     def publish_prm_markers(self, G):
         markers = MarkerArray()
@@ -117,7 +119,6 @@ class PRMPlanner(Node):
         markers.markers.append(edge_marker)
 
         self.marker_pub.publish(markers)
-
 
     def world_to_map(self, x, y):
         info = self.map_msg.info
@@ -230,6 +231,7 @@ class PRMPlanner(Node):
 
     # ---------------- main planner ----------------
     def compute_plan(self):
+        # build roadmap
         samples = self.sample_free_points(self.n_samples)
         G = self.build_prm(samples, self.k_neighbors)
 
@@ -238,33 +240,113 @@ class PRMPlanner(Node):
         start_id = self.connect_new_node(G, start, self.k_neighbors)
         goal_id = self.connect_new_node(G, goal, self.k_neighbors)
 
+        # try A*
         try:
             path_idx = nx.astar_path(
                 G, start_id, goal_id,
                 heuristic=lambda a, b: self.euclidean(G.nodes[a]['pos'], G.nodes[b]['pos']),
                 weight='weight'
             )
-        except nx.NetworkXNoPath:
-            self.get_logger().warn("No se encontró ruta con PRM+A*")
+            # if success -> publish full Path
+            path = Path()
+            path.header = Header()
+            path.header.stamp = self.get_clock().now().to_msg()
+            path.header.frame_id = self.map_frame
+
+            for idx in path_idx:
+                x, y = G.nodes[idx]['pos']
+                pose = PoseStamped()
+                pose.header = path.header
+                pose.pose.position.x = float(x)
+                pose.pose.position.y = float(y)
+                pose.pose.orientation.w = 1.0
+                path.poses.append(pose)
+
+            self.plan_pub.publish(path)
+            self.get_logger().info(f"Plan publicado con {len(path.poses)} puntos")
+            self.publish_prm_markers(G)
             return
 
-        path = Path()
-        path.header = Header()
-        path.header.stamp = self.get_clock().now().to_msg()
-        path.header.frame_id = self.map_frame
+        except nx.NetworkXNoPath:
+            self.get_logger().warn("No se encontró ruta con PRM+A* -> calculando candidato alcanzable...")
 
-        for idx in path_idx:
-            x, y = G.nodes[idx]['pos']
-            pose = PoseStamped()
-            pose.header = path.header
-            pose.pose.position.x = float(x)
-            pose.pose.position.y = float(y)
-            pose.pose.orientation.w = 1.0
-            path.poses.append(pose)
+        # ---------- Si no hay camino: elegir mejor nodo alcanzable ----------
+        # Encontrar nodos alcanzables desde start_id (BFS en grafo)
+        reachable_nodes = set()
+        from collections import deque
+        dq = deque([start_id])
+        reachable_nodes.add(start_id)
+        while dq:
+            u = dq.popleft()
+            for v in G.neighbors(u):
+                if v not in reachable_nodes:
+                    reachable_nodes.add(v)
+                    dq.append(v)
 
-        self.plan_pub.publish(path)
-        self.get_logger().info(f"Plan publicado con {len(path.poses)} puntos")
-        self.publish_prm_markers(G)
+        # Si no hay nodos alcanzables (salvo start), salimos
+        if len(reachable_nodes) <= 1:
+            self.get_logger().warn("No hay nodos alcanzables en el roadmap.")
+            # publicamos markers para debug
+            self.publish_prm_markers(G)
+            return
+
+        # De los nodos alcanzables, elegimos el que minimiza heurística hacia goal
+        best_node = None
+        best_h = float('inf')
+        for n in reachable_nodes:
+            if n == start_id:
+                continue
+            pos = G.nodes[n]['pos']
+            # heurística: distancia desde nodo hasta goal + pequeña penalización por distancia al robot
+            h = 0.9 * self.euclidean(pos, (goal[0], goal[1])) + 0.1 * self.euclidean(pos, start)
+            if h < best_h:
+                best_h = h
+                best_node = n
+
+        if best_node is None:
+            self.get_logger().warn("No se encontró candidato entre nodos alcanzables.")
+            self.publish_prm_markers(G)
+            return
+
+        # publicar candidato como PoseStamped (mundo)
+        bx, by = G.nodes[best_node]['pos']
+        candidate = PoseStamped()
+        candidate.header = Header()
+        candidate.header.stamp = self.get_clock().now().to_msg()
+        candidate.header.frame_id = self.map_frame
+        candidate.pose.position.x = float(bx)
+        candidate.pose.position.y = float(by)
+        candidate.pose.orientation.w = 1.0
+        self.candidate_pub.publish(candidate)
+        self.get_logger().info(f"Publicado candidato PRM alcanzable en ({bx:.2f}, {by:.2f})")
+
+        # ---------- NUEVO: generar también Path hasta el candidato ----------
+        try:
+            path_idx = nx.astar_path(
+                G, start_id, best_node,
+                heuristic=lambda a, b: self.euclidean(G.nodes[a]['pos'], G.nodes[b]['pos']),
+                weight='weight'
+            )
+
+            path = Path()
+            path.header = Header()
+            path.header.stamp = self.get_clock().now().to_msg()
+            path.header.frame_id = self.map_frame
+
+            for idx in path_idx:
+                x, y = G.nodes[idx]['pos']
+                pose = PoseStamped()
+                pose.header = path.header
+                pose.pose.position.x = float(x)
+                pose.pose.position.y = float(y)
+                pose.pose.orientation.w = 1.0
+                path.poses.append(pose)
+
+            self.plan_pub.publish(path)
+            self.get_logger().info(f"Publicado plan hacia candidato con {len(path.poses)} puntos")
+
+        except nx.NetworkXNoPath:
+            self.get_logger().warn("⚠️ No se pudo construir camino hasta el candidato, aunque era alcanzable.")
 
 
 def main(args=None):
@@ -275,7 +357,6 @@ def main(args=None):
     finally:
         node.destroy_node()
         rclpy.shutdown()
-
 
 if __name__ == '__main__':
     main()
